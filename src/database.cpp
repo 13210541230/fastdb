@@ -2437,6 +2437,7 @@ bool dbDatabase::open(OpenParameters& params)
 bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                       time_t waitLockTimeoutMsec, time_t commitDelaySec)
 {
+    // 初始化部分成员变量，释放上次分配的数据库名和文件名
     waitLockTimeout = (unsigned)waitLockTimeoutMsec;
     delete[] databaseName;
     delete[] fileName;
@@ -2450,6 +2451,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
     logger = NULL;
     stopDelayedCommitThread = false;
     memset(tableHash, 0, sizeof tableHash);
+
+    // 生成数据库名和文件名
     databaseNameLen = (int)_tcslen(dbName);
     char_t* name = new char_t[databaseNameLen+16];
     _stprintf(name, _T("%s.in"), dbName);
@@ -2462,12 +2465,15 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
         _stprintf(fileName, fiName);
     }
 
+    // 初始化互斥体，确保数据库初始化过程的唯一性
     dbInitializationMutex::initializationStatus status = initMutex.initialize(name);
     if (status == dbInitializationMutex::InitializationError) {
         handleError(DatabaseOpenError,
                     "Failed to start database initialization");
         return false;
     }
+
+    // 打开数据库监控共享内存
     _stprintf(name, _T("%s.dm"), dbName);
     if (!shm.open(name)) {
         cleanup(status, 0);
@@ -2475,6 +2481,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
         return false;
     }
     monitor = shm.get();
+
+    // 打开写入信号量
     _stprintf(name, _T("%s.ws"), dbName);
     if (!writeSem.open(name)) {
         cleanup(status, 1);
@@ -2482,6 +2490,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                     "Failed to initialize database writers semaphore");
         return false;
     }
+
+    // 打开读取信号量
     _stprintf(name, _T("%s.rs"), dbName);
     if (!readSem.open(name)) {
         cleanup(status, 2);
@@ -2489,6 +2499,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                     "Failed to initialize database readers semaphore");
         return false;
     }
+
+    // 打开升级信号量
     _stprintf(name, _T("%s.us"), dbName);
     if (!upgradeSem.open(name)) {
         cleanup(status, 3);
@@ -2496,6 +2508,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                     "Failed to initialize database upgrade semaphore");
         return false;
     }
+
+    // 打开备份完成事件
     _stprintf(name, _T("%s.bce"), dbName);
     if (!backupCompletedEvent.open(name)) {
         cleanup(status, 4);
@@ -2503,6 +2517,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                     "Failed to initialize database backup completed event");
         return false;
     }
+
+    // 如果启用了延迟提交，打开相关事件
     if (commitDelaySec != 0) {
         _stprintf(name, _T("%s.dce"), dbName);
         delayedCommitEventsOpened = true;
@@ -2518,6 +2534,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
     backupInitEvent.open();
     backupFileName = NULL;
 
+    // 初始化内存分配器和相关成员变量
     fixedSizeAllocator.reset();
     allocatedSize = 0;
     deallocatedSize = 0;
@@ -2526,12 +2543,12 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
     indexSize = DOALIGN(indexSize, dbHandlesPerPage);
 
     size_t fileSize = initSize ? initSize : dbDefaultInitDatabaseSize;
-
     if (fileSize < indexSize*sizeof(offs_t)*4) {
         fileSize = indexSize*sizeof(offs_t)*4;
     }
     fileSize = DOALIGN(fileSize, dbBitmapSegmentSize);
 
+    // 初始化位图相关成员
     for (int i = dbBitmapId + dbBitmapPages; --i >= 0;) {
         bitmapPageAvailableSpace[i] = INT_MAX;
     }
@@ -2545,15 +2562,20 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
     selfId = 0;
     maxClientId = 0;
     threadContextList.reset();
+
+    // 关联共享内存，初始化数据库监控结构
     attach();
 
+    // 如果是首次初始化数据库
     if (status == dbInitializationMutex::NotYetInitialized) {
         _stprintf(name, _T("%s.cs"), dbName);
+        // 创建主互斥体
         if (!cs.create(name, &monitor->sem)) {
             cleanup(status, 6);
             handleError(DatabaseOpenError, "Failed to initialize database monitor");
             return false;
         }
+        // 并发访问模式下，创建变更互斥体
         if (accessType == dbConcurrentUpdate || accessType == dbConcurrentRead) {
             _stprintf(name, _T("%s.mcs"), dbName);
             if (!mutatorCS.create(name, &monitor->mutatorSem)) {
@@ -2563,6 +2585,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                 return false;
             }
         }
+        // 重置信号量和监控结构体
         readSem.reset();
         writeSem.reset();
         upgradeSem.reset();
@@ -2591,6 +2614,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
         monitor->sessionFreeList[1].head = monitor->sessionFreeList[1].tail = 0;
 #endif
 
+        // 创建数据库文件
         _stprintf(databaseName, _T("%s.%d"), dbName, version);
         int rc = file.open(fileName, databaseName, fileOpenFlags, fileSize, false);
         if (rc != dbFile::ok)
@@ -2607,12 +2631,14 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
         header = (dbHeader*)baseAddr;
         updatedRecordId = 0;
 
+        // 检查数据库头部有效性
         if ((unsigned)header->curr > 1) {
             cleanup(status, 9);
             handleError(DatabaseOpenError, "Database file was corrupted: "
                         "invalid root index");
             return false;
         }
+        // 如果数据库未初始化，进行初始化
         if (header->initialized != 1) {
             if (accessType == dbReadOnly || accessType == dbConcurrentRead) {
                 cleanup(status, 9);
@@ -2620,6 +2646,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
                             "file in read only mode");
                 return false;
             }
+            // 初始化头部和索引结构
             monitor->curr = header->curr = 0;
             header->size = (offs_t)fileSize;
             size_t used = dbPageSize;
@@ -2648,6 +2675,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
             index[1] = (offs_t*)(baseAddr + header->root[1].index);
             index[0][dbInvalidId] = dbFreeHandleMarker;
 
+            // 初始化位图页面
             size_t bitmapPages =
                 (used + dbPageSize*(dbAllocationQuantum*8-1) - 1)
                 / (dbPageSize*(dbAllocationQuantum*8-1));
@@ -2676,6 +2704,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
             file.markAsDirty(0, sizeof(dbHeader));
             file.flush(true);
         } else {
+            // 检查数据库兼容性和一致性
             if (!header->isCompatible()) {
                 cleanup(status, 9);
                 handleError(DatabaseOpenError, "Incompatible database mode");
@@ -2703,6 +2732,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
             }
         }
     } else {
+        // 非首次初始化，直接打开互斥体和信号量
         _stprintf(name, _T("%s.cs"), dbName);
         if (!cs.open(name, &monitor->sem)) {
             cleanup(status, 6);
@@ -2720,6 +2750,8 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
         version = 0;
         initMutex.done();
     }
+
+    // 进入临界区，分配客户端ID
     cs.enter();
     monitor->users += 1;
     selfId = ++monitor->clientId;
@@ -2730,6 +2762,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
 #endif
     cs.leave();
 
+    // 加载数据库结构定义（scheme）
     if (status == dbInitializationMutex::NotYetInitialized) {
         if (!loadScheme(true)) {
             cleanup(status, 9);
@@ -2744,6 +2777,7 @@ bool dbDatabase::open(char_t const* dbName, char_t const* fiName,
     }
     opened = true;
 
+    // 如果启用了延迟提交，启动提交线程
     if (commitDelaySec != 0) {
         dbCriticalSection cs(delayedCommitStartTimerMutex);
         commitTimeout = commitDelay = commitDelaySec;
@@ -2872,15 +2906,22 @@ void dbDatabase::recovery()
 
 void dbDatabase::restoreTablesConsistency()
 {
+    // 获取元表（MetaTable）对象指针
     dbTable* table = (dbTable*)getRow(dbMetaTableId);
+
+    // 检查元表的最后一个表记录的 next 指针是否为 0（即链表尾部），如不是则修正
     oid_t lastId = table->lastRow;
     if (lastId != 0) {
         dbRecord* record = getRow(lastId);
         if (record->next != 0) {
+            // 修正链表尾部的 next 指针为 0
             record->next = 0;
+            // 标记该记录为脏页，确保后续写回磁盘
             file.markAsDirty(currIndex[lastId], sizeof(dbRecord));
         }
     }
+
+    // 遍历所有表，修正每个表的链表尾部的 next 指针
     oid_t tableId = table->firstRow;
     while (tableId != 0) {
         table = (dbTable*)getRow(tableId);
@@ -2888,10 +2929,12 @@ void dbDatabase::restoreTablesConsistency()
         if (lastId != 0) {
             dbRecord* record = getRow(lastId);
             if (record->next != 0) {
+                // 修正该表链表尾部的 next 指针为 0
                 record->next = 0;
                 file.markAsDirty(currIndex[lastId], sizeof(dbRecord));
             }
         }
+        // 继续遍历下一个表
         tableId = table->next;
     }
 }
@@ -2910,6 +2953,7 @@ void dbDatabase::setConcurrency(unsigned nThreads)
 
 bool dbDatabase::loadScheme(bool alter)
 {
+    // 根据参数和访问类型，决定加锁模式，开启事务
     if (!beginTransaction((alter && accessType != dbReadOnly && accessType != dbConcurrentRead)
                           || accessType == dbConcurrentUpdate
                           ? dbExclusiveLock : dbSharedLock))
@@ -2917,24 +2961,29 @@ bool dbDatabase::loadScheme(bool alter)
         return false;
     }
 
+    // 获取元表指针和表链表的头尾及表数量
     dbTable* metaTable = (dbTable*)getRow(dbMetaTableId);
     oid_t first = metaTable->firstRow;
     oid_t last = metaTable->lastRow;
     int nTables = metaTable->nRows;
     oid_t tableId = first;
 
+    // 检查表描述符链表是否为空
     if (dbTableDescriptor::chain != NULL) {
         dbTableDescriptor *desc, *next;
-        dbCriticalSection cs(dbTableDescriptor::getChainMutex());
+        dbCriticalSection cs(dbTableDescriptor::getChainMutex()); // 加锁保护链表遍历
         for (desc = dbTableDescriptor::chain; desc != NULL; desc = next) {
             next = desc->next;
+            // 跳过已绑定到其他数据库的描述符
             if (desc->db != NULL && desc->db != DETACHED_TABLE && desc->db != this) {
                 continue;
             }
+            // 如果是分离表，进行克隆
             if (desc->db == DETACHED_TABLE) {
                 desc = desc->clone();
             }
             desc->db = this;
+            // 初始化所有字段的索引指针和属性
             dbFieldDescriptor* fd;
             for (fd = desc->firstField; fd != NULL; fd = fd->nextField) {
                 fd->tTree = 0;
@@ -2942,6 +2991,7 @@ bool dbDatabase::loadScheme(bool alter)
                 fd->attr &= ~dbFieldDescriptor::Updated;
             }
 
+            // 在数据库中查找同名表
             int n = nTables;
             while (--n >= 0) {
                 dbTable* table = (dbTable*)getRow(tableId);
@@ -2950,35 +3000,42 @@ bool dbDatabase::loadScheme(bool alter)
                     return false;
                 }
                 oid_t next = table->next;
+                // 名称匹配
                 if (strcmp(desc->name, (char*)table + table->name.offs) == 0) {
+                    // 如果表结构不一致
                     if (!desc->equal(table)) {
                         if (!alter) {
                             handleError(DatabaseOpenError, "Incompatible class"
                                         " definition in application");
                             return false;
                         }
-                        beginTransaction(dbExclusiveLock);
+                        beginTransaction(dbExclusiveLock); // 需要独占锁
                         modified = true;
                         if (table->nRows == 0) {
+                            // 表为空，直接替换定义
                             TRACE_MSG(("Replace definition of table '%s'\n",  desc->name));
                             desc->match(table, true, true);
                             updateTableDescriptor(desc, tableId);
                         } else {
+                            // 表有数据，需要重构表结构
                             reformatTable(tableId, desc);
                         }
                     } else {
+                        // 表结构一致，建立关联
                         linkTable(desc, tableId);
                     }
-                    desc->setFlags();
+                    desc->setFlags(); // 设置表标志
                     break;
                 }
+                // 遍历下一个表
                 if (tableId == last) {
                     tableId = first;
                 } else {
                     tableId = next;
                 }
             }
-            if (n < 0) { // no match found
+            // 如果没有找到同名表
+            if (n < 0) {
                 if (accessType == dbReadOnly || accessType == dbConcurrentRead) {
                     TRACE_IMSG(("Table '%s' can not be added to the read-only database\n", desc->name));
                     handleError(DatabaseOpenError, "New table definition can not "
@@ -2986,10 +3043,11 @@ bool dbDatabase::loadScheme(bool alter)
                     return false;
                 } else {
                     TRACE_MSG(("Create new table '%s' in database\n", desc->name));
-                    addNewTable(desc);
+                    addNewTable(desc); // 新建表
                     modified = true;
                 }
             }
+            // 添加或变更索引
             if (accessType != dbReadOnly && accessType != dbConcurrentRead) {
                 if (!addIndices(alter, desc)) {
                     handleError(DatabaseOpenError, "Failed to alter indices with"
@@ -2999,6 +3057,7 @@ bool dbDatabase::loadScheme(bool alter)
                 }
             }
         }
+        // 处理表的引用关系
         for (desc = tables; desc != NULL; desc = desc->nextDbTable) {
             if (desc->cloneOf != NULL) {
                 for (dbFieldDescriptor *fd = desc->firstField; fd != NULL; fd = fd->nextField)
@@ -3011,7 +3070,7 @@ bool dbDatabase::loadScheme(bool alter)
             desc->checkRelationship();
         }
     }
-    commit();
+    commit(); // 提交事务
     return true;
 }
 
@@ -3020,29 +3079,36 @@ void dbDatabase::reformatTable(oid_t tableId, dbTableDescriptor* desc)
 {
     dbTable* table = (dbTable*)putRow(tableId);
 
+    // 检查新旧表结构是否兼容
     if (desc->match(table, confirmDeleteColumns, false)) {
         TRACE_MSG(("New version of table '%s' is compatible with old one\n",
                    desc->name));
+        // 兼容则只需更新表描述符，无需迁移数据
         updateTableDescriptor(desc, tableId);
     } else {
         TRACE_MSG(("Reformat table '%s'\n", desc->name));
+        // 不兼容则需要对所有记录进行重格式化
         oid_t oid = table->firstRow;
         updateTableDescriptor(desc, tableId);
         while (oid != 0) {
             dbRecord* record = getRow(oid);
+            // 计算新结构下该记录所需的新空间大小
             size_t size =
                 desc->columns->calculateNewRecordSize((byte*)record,
                                                      desc->fixedSize);
             offs_t offs = currIndex[oid];
+            // 分配新空间并返回新 record 指针
             record = putRow(oid, size);
             byte* dst = (byte*)record;
             byte* src = baseAddr + offs;
             if (dst == src) {
+                // 如果新旧空间重叠，先用临时缓冲区转换
                 dbSmallBuffer buf(size);
                 dst = (byte*)buf.base();
                 desc->columns->convertRecord(dst, src, desc->fixedSize);
                 memcpy(record+1, dst+sizeof(dbRecord), size-sizeof(dbRecord));
             } else {
+                // 直接转换记录内容到新空间
                 desc->columns->convertRecord(dst, src, desc->fixedSize);
             }
             oid = record->next;
@@ -3052,32 +3118,37 @@ void dbDatabase::reformatTable(oid_t tableId, dbTableDescriptor* desc)
 
 void dbDatabase::deleteTable(dbTableDescriptor* desc)
 {
-    beginTransaction(dbExclusiveLock);
+    beginTransaction(dbExclusiveLock); // 启动独占事务
     modified = true;
     dbTable* table = (dbTable*)putRow(desc->tableId);
     oid_t rowId = table->firstRow;
+    // 清空表中的所有记录信息
     table->firstRow = table->lastRow = 0;
     table->nRows = 0;
 
+    // 遍历并删除所有记录
     while (rowId != 0) {
         dbRecord* record = getRow(rowId);
         oid_t nextId = record->next;
         size_t size = record->size;
 
-        removeInverseReferences(desc, rowId);
+        removeInverseReferences(desc, rowId); // 移除反向引用
 
+        // 判断是否需要 clone bitmap（多版本支持），否则直接回收空间
         if (rowId < committedIndexSize && index[0][rowId] == index[1][rowId]) {
             cloneBitmap(currIndex[rowId], size);
         } else {
             deallocate(currIndex[rowId], size);
         }
-        freeId(rowId);
+        freeId(rowId); // 释放对象ID
         rowId = nextId;
     }
+    // 清理所有哈希索引
     dbFieldDescriptor* fd;
     for (fd = desc->hashedFields; fd != NULL; fd = fd->nextHashedField) {
         dbHashTable::purge(this, fd->hashTable);
     }
+    // 清理所有树型索引
     for (fd = desc->indexedFields; fd != NULL; fd = fd->nextIndexedField) {
         if (fd->type == dbField::tpRectangle) {
             dbRtree::purge(this, fd->tTree);
@@ -3089,18 +3160,21 @@ void dbDatabase::deleteTable(dbTableDescriptor* desc)
 
 void dbDatabase::dropHashTable(dbFieldDescriptor* fd)
 {
-    beginTransaction(dbExclusiveLock);
+    beginTransaction(dbExclusiveLock); // 启动独占事务
     modified = true;
+    // 删除哈希表结构和数据
     dbHashTable::drop(this, fd->hashTable);
     fd->hashTable = 0;
     fd->indexType &= ~HASHED;
 
+    // 从表的 hashedFields 链表中移除该字段
     dbFieldDescriptor** fpp = &fd->defTable->hashedFields;
     while (*fpp != fd) {
         fpp = &(*fpp)->nextHashedField;
     }
     *fpp = fd->nextHashedField;
 
+    // 更新表中的字段元数据，清除 hashTable 引用
     dbTable* table = (dbTable*)putRow(fd->defTable->tableId);
     dbField* field = (dbField*)((char*)table + table->fields.offs);
     field[fd->fieldNo].hashTable = 0;
@@ -3108,8 +3182,9 @@ void dbDatabase::dropHashTable(dbFieldDescriptor* fd)
 
 void dbDatabase::dropIndex(dbFieldDescriptor* fd)
 {
-    beginTransaction(dbExclusiveLock);
+    beginTransaction(dbExclusiveLock); // 启动独占事务
     modified = true;
+    // 删除对应类型的索引结构
     if (fd->type == dbField::tpRectangle) {
         dbRtree::drop(this, fd->tTree);
     } else {
@@ -3118,12 +3193,14 @@ void dbDatabase::dropIndex(dbFieldDescriptor* fd)
     fd->tTree = 0;
     fd->indexType &= ~INDEXED;
 
+    // 从表的 indexedFields 链表中移除该字段
     dbFieldDescriptor** fpp = &fd->defTable->indexedFields;
     while (*fpp != fd) {
         fpp = &(*fpp)->nextIndexedField;
     }
     *fpp = fd->nextIndexedField;
 
+    // 更新表中的字段元数据，清除 tTree 引用
     dbTable* table = (dbTable*)putRow(fd->defTable->tableId);
     dbField* field = (dbField*)((char*)table + table->fields.offs);
     field[fd->fieldNo].tTree = 0;
@@ -3131,44 +3208,52 @@ void dbDatabase::dropIndex(dbFieldDescriptor* fd)
 
 void dbDatabase::createHashTable(dbFieldDescriptor* fd)
 {
-    beginTransaction(dbExclusiveLock);
+    beginTransaction(dbExclusiveLock); // 启动独占事务
     modified = true;
+    // 获取表对象和当前行数
     dbTable* table = (dbTable*)getRow(fd->defTable->tableId);
     size_t nRows = table->nRows;
+    // 分配新的哈希表，容量为2倍行数
     fd->hashTable = dbHashTable::allocate(this, 2*nRows);
     fd->attr &= ~dbFieldDescriptor::Updated;
+    // 将该字段插入表的 hashedFields 链表
     fd->nextHashedField = fd->defTable->hashedFields;
     fd->defTable->hashedFields = fd;
     fd->indexType |= HASHED;
+    // 更新表元数据
     table = (dbTable*)putRow(fd->defTable->tableId);
     dbField* field = (dbField*)((char*)table + table->fields.offs);
     field[fd->fieldNo].hashTable = fd->hashTable;
     field[fd->fieldNo].flags = fd->indexType;
 
+    // 遍历所有记录，将其插入哈希表
     for (oid_t oid = table->firstRow; oid != 0; oid = getRow(oid)->next) {
         dbHashTable::insert(this, fd, oid, nRows);
     }
 }
 
-
 void dbDatabase::createIndex(dbFieldDescriptor* fd)
 {
-    beginTransaction(dbExclusiveLock);
+    beginTransaction(dbExclusiveLock); // 启动独占事务
     modified = true;
+    // 根据字段类型分配索引结构
     if (fd->type == dbField::tpRectangle) {
         fd->tTree = dbRtree::allocate(this);
     } else {
         fd->tTree = dbTtree::allocate(this);
     }
     fd->attr &= ~dbFieldDescriptor::Updated;
+    // 将该字段插入表的 indexedFields 链表
     fd->nextIndexedField = fd->defTable->indexedFields;
     fd->defTable->indexedFields = fd;
     fd->indexType |= INDEXED;
+    // 更新表元数据
     dbTable* table = (dbTable*)putRow(fd->defTable->tableId);
     dbField* field = (dbField*)((char*)table + table->fields.offs);
     field[fd->fieldNo].tTree = fd->tTree;
     field[fd->fieldNo].flags = fd->indexType;
 
+    // 遍历所有记录，将其插入索引结构
     for (oid_t oid = table->firstRow; oid != 0; oid = getRow(oid)->next) {
         if (fd->type == dbField::tpRectangle) {
             dbRtree::insert(this, fd->tTree, oid, fd->dbsOffs);
@@ -3180,9 +3265,12 @@ void dbDatabase::createIndex(dbFieldDescriptor* fd)
 
 void dbDatabase::dropTable(dbTableDescriptor* desc)
 {
+    // 先删除表的所有数据和索引
     deleteTable(desc);
+    // 从元表中移除该表
     freeRow(dbMetaTableId, desc->tableId);
 
+    // 彻底释放所有哈希索引和树型索引结构
     dbFieldDescriptor* fd;
     for (fd = desc->hashedFields; fd != NULL; fd = fd->nextHashedField) {
         dbHashTable::drop(this, fd->hashTable);
@@ -5181,21 +5269,27 @@ void dbDatabase::freeObject(oid_t oid)
 }
 
 
+// 更新指定oid的记录
 void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
 {
+    // 断言数据库已打开
     FASTDB_ASSERT(opened);
+    // 开启独占事务
     beginTransaction(dbExclusiveLock);
-    size_t size =
-        desc->columns->calculateRecordSize((byte*)record, desc->fixedSize);
+    // 计算新记录的实际存储大小
+    size_t size = desc->columns->calculateRecordSize((byte*)record, desc->fixedSize);
 
     byte* src = (byte*)record;
+    // 标记被更新的字段
     desc->columns->markUpdatedFields((byte*)getRow(oid), src);
 
     dbFieldDescriptor* fd;
     if (inverseReferencesUpdate) {
+        // 处理反向引用字段
         updatedRecordId = oid;
         for (fd = desc->inverseFields; fd != NULL; fd = fd->nextInverseField) {
             if (fd->type == dbField::tpArray) {
+                // 处理数组类型的反向引用
                 dbAnyArray* arr = (dbAnyArray*)(src + fd->appOffs);
                 int n = (int)arr->length();
                 oid_t* newrefs = (oid_t*)arr->base();
@@ -5206,6 +5300,7 @@ void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
                 int i, j, k;
                 old += offs;
 
+                // 查找被移除的旧引用并删除反向引用
                 for (i = j = 0; i < m; i++) {
                     oid_t oldref = *((oid_t*)old + i);
                     if (oldref != 0) {
@@ -5221,6 +5316,7 @@ void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
                         }
                     }
                 }
+                // 查找新添加的引用并插入反向引用
                 for (i = j = 0; i < n; i++) {
                     if (newrefs[i] != 0) {
                         for(k=j; j < m && newrefs[i] != *((oid_t*)old+j); j++);
@@ -5236,6 +5332,7 @@ void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
                     }
                 }
             } else {
+                // 处理非数组类型的反向引用
                 oid_t newref = *(oid_t*)(src + fd->appOffs);
                 byte* old = (byte*)getRow(oid);
                 oid_t oldref = *(oid_t*)(old + fd->dbsOffs);
@@ -5251,11 +5348,13 @@ void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
         }
         updatedRecordId = 0;
     }
+    // 移除哈希字段旧索引
     for (fd = desc->hashedFields; fd != NULL; fd = fd->nextHashedField) {
         if (fd->attr & dbFieldDescriptor::Updated) {
             dbHashTable::remove(this, fd, oid);
         }
     }
+    // 移除普通索引（包括R树和T树）
     for (fd = desc->indexedFields; fd != NULL; fd = fd->nextIndexedField) {
         if (fd->attr & dbFieldDescriptor::Updated) {
             if (fd->type == dbField::tpRectangle) {
@@ -5266,28 +5365,35 @@ void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
         }
     }
 
+    // 获取原始数据指针
     byte* old = (byte*)getRow(oid);
+    // 分配空间用于新数据
     byte* dst = (byte*)putRow(oid, size);
     if (dst == old) {
+        // 数据大小未变，直接覆盖
         dbSmallBuffer buf(size);
         byte* temp = (byte*)buf.base();
         desc->columns->storeRecordFields(temp, src, desc->fixedSize, dbFieldDescriptor::Update);
         memcpy(dst+sizeof(dbRecord), temp+sizeof(dbRecord), size-sizeof(dbRecord));
     } else {
+        // 数据大小变化，重新存储
         desc->columns->storeRecordFields(dst, src, desc->fixedSize, dbFieldDescriptor::Update);
     }
     modified = true;
+    // 日志记录
     if (logger != NULL) {
         if (!logger->update(desc, oid, (dbRecord*)dst, record)) {
             handleError(RejectedByTransactionLogger);
         }
     }
 
+    // 重新插入哈希字段索引
     for (fd = desc->hashedFields; fd != NULL; fd = fd->nextHashedField) {
         if (fd->attr & dbFieldDescriptor::Updated) {
             dbHashTable::insert(this, fd, oid, 0);
         }
     }
+    // 重新插入普通索引
     for (fd = desc->indexedFields; fd != NULL; fd = fd->nextIndexedField) {
         if (fd->attr & dbFieldDescriptor::Updated) {
             if (fd->type == dbField::tpRectangle) {
@@ -5298,42 +5404,52 @@ void dbDatabase::update(oid_t oid, dbTableDescriptor* desc, void const* record)
             fd->attr &= ~dbFieldDescriptor::Updated;
         }
     }
+    // 清除哈希字段的更新标记
     for (fd = desc->hashedFields; fd != NULL; fd = fd->nextHashedField) {
         fd->attr &= ~dbFieldDescriptor::Updated;
     }
+    // 更新游标
     updateCursors(oid);
 }
 
-
-void dbDatabase::insertRecord(dbTableDescriptor* desc, dbAnyReference* ref,
-                              void const* record)
+// 插入新记录
+void dbDatabase::insertRecord(dbTableDescriptor* desc, dbAnyReference* ref, void const* record)
 {
+    // 断言数据库已打开
     FASTDB_ASSERT(opened);
+    // 开启独占事务
     beginTransaction(dbExclusiveLock);
     modified = true;
-    size_t size =
-        desc->columns->calculateRecordSize((byte*)record, desc->fixedSize);
+    // 计算新记录的实际存储大小
+    size_t size = desc->columns->calculateRecordSize((byte*)record, desc->fixedSize);
 
     dbTable* table = (dbTable*)getRow(desc->tableId);
 #ifdef AUTOINCREMENT_SUPPORT
+    // 自增字段处理
     desc->autoincrementCount = table->count + 1;
 #endif
     size_t nRows = table->nRows+1;
+    // 分配新行
     oid_t oid = allocateRow(desc->tableId, size);
     byte* src = (byte*)record;
     byte* dst = (byte*)getRow(oid);
+    // 存储记录字段
     desc->columns->storeRecordFields(dst, src, desc->fixedSize, dbFieldDescriptor::Insert);
+    // 日志记录
     if (logger != NULL) {
         if (!logger->insert(desc, oid, (dbRecord*)dst, record)) {
             freeRow(desc->tableId, oid);
             handleError(RejectedByTransactionLogger);
         }
     }
+    // 设置返回引用的oid
     ref->oid = oid;
     dbFieldDescriptor* fd;
     if (inverseReferencesUpdate) {
+        // 处理反向引用字段
         for (fd = desc->inverseFields; fd != NULL; fd = fd->nextInverseField) {
             if (fd->type == dbField::tpArray) {
+                // 处理数组类型的反向引用
                 dbAnyArray* arr = (dbAnyArray*)(src + fd->appOffs);
                 int n = (int)arr->length();
                 oid_t* refs = (oid_t*)arr->base();
@@ -5343,6 +5459,7 @@ void dbDatabase::insertRecord(dbTableDescriptor* desc, dbAnyReference* ref,
                     }
                 }
             } else {
+                // 处理非数组类型的反向引用
                 oid_t ref = *(oid_t*)(src + fd->appOffs);
                 if (ref != 0) {
                     insertInverseReference(fd, oid, ref);
@@ -5350,9 +5467,11 @@ void dbDatabase::insertRecord(dbTableDescriptor* desc, dbAnyReference* ref,
             }
         }
     }
+    // 插入哈希字段索引
     for (fd = desc->hashedFields; fd != NULL; fd = fd->nextHashedField) {
         dbHashTable::insert(this, fd, oid, nRows);
     }
+    // 插入普通索引
     for (fd = desc->indexedFields; fd != NULL; fd = fd->nextIndexedField) {
         if (fd->type == dbField::tpRectangle) {
             dbRtree::insert(this, fd->tTree, oid, fd->dbsOffs);
@@ -5363,32 +5482,49 @@ void dbDatabase::insertRecord(dbTableDescriptor* desc, dbAnyReference* ref,
 }
 
 
+/**
+ *  Extend the database file size to the given value. If the
+ *  new size is larger than the current size, the file is
+ *  extended, and the cursors are updated to point to the
+ *  correct position in the new file. If the new size is
+ *  smaller than the current size, the file is not extended.
+ *  If the new size is larger than the file size limit, a
+ *  FileLimitExeeded error is raised.
+ *  @param size The new size of the database file.
+ */
 inline void dbDatabase::extend(offs_t size)
 {
-    size_t oldSize = header->size;
+    size_t oldSize = header->size; // 记录原有文件大小
 
+    // 如果扩展后的大小大于已使用空间，则更新已使用空间
     if (size > header->used) {
         header->used = size;
     }
+    // 如果扩展后的大小大于原有文件大小，则进行扩展
     if (size > oldSize) {
 #ifdef DISKLESS_CONFIGURATION
+        // 无盘配置下，超出文件限制则报错
         handleError(FileLimitExeeded);
 #endif
+        // 检查是否超出文件大小限制
         if (fileSizeLimit != 0 && size > fileSizeLimit) {
             handleError(FileLimitExeeded);
         }
         dbDatabaseThreadContext* ctx = threadContext.get();
-        FASTDB_ASSERT(ctx != NULL);
+        FASTDB_ASSERT(ctx != NULL); // 线程上下文不能为空
+        // 如果当前持有互斥锁但没有写权限，则开启事务
         if (ctx->mutatorCSLocked && !ctx->writeAccess) {
             beginTransaction(dbCommitLock);
         }
+        // 如果原大小的两倍大于目标 size，则选择下一个 2 的幂次方作为新大小
         if (oldSize*2 > size) {
-            size_t newSize = 64*1024;
+            size_t newSize = 64*1024; // 初始最小扩展为 64KB
             while (newSize < size) {
-                newSize <<= 1;
+                newSize <<= 1; // 逐步左移，直到大于等于 size
             }
+            // 如果新大小未超出文件限制，则采用新大小
             if (fileSizeLimit == 0 || newSize <= fileSizeLimit) {
-                if (offs_t(newSize) == 0) { // overflow
+                if (offs_t(newSize) == 0) { // 溢出检查
                     handleError(FileLimitExeeded);
                 }
                 size = (offs_t)newSize;
@@ -5396,36 +5532,38 @@ inline void dbDatabase::extend(offs_t size)
                 size = (offs_t)fileSizeLimit;
             }
         }
+        // 打印扩展日志
         TRACE_MSG(("Extend database file from %ld to %ld bytes\n",
                    (long)header->size, (long)size));
-        header->size = size;
-        version = ++monitor->version;
-        _stprintf(databaseName + databaseNameLen, _T(".%d"), version);
-        int status = file.setSize(size, databaseName);
-        // file.markAsDirty(oldSize, size - oldSize);
-        byte* addr = (byte*)file.getAddr();
-        size_t shift = addr - baseAddr;
+        header->size = size; // 更新头部记录的文件大小
+        version = ++monitor->version; // 版本号递增
+        _stprintf(databaseName + databaseNameLen, _T(".%d"), version); // 生成新文件名
+        int status = file.setSize(size, databaseName); // 实际扩展文件大小
+        // file.markAsDirty(oldSize, size - oldSize); // 标记新扩展区域为脏
+        byte* addr = (byte*)file.getAddr(); // 获取新映射的内存地址
+        size_t shift = addr - baseAddr; // 计算地址偏移
+        // 如果基地址发生变化，需要调整所有游标和索引的指针
         if (shift != 0) {
             size_t base = (size_t)baseAddr;
             for (dbL2List* cursor = ctx->cursors.next;
                  cursor != &ctx->cursors;
                  cursor = cursor->next)
             {
-                ((dbAnyCursor*)cursor)->adjustReferences(base, oldSize, shift);
+                ((dbAnyCursor*)cursor)->adjustReferences(base, oldSize, shift); // 调整游标引用
             }
-            baseAddr = addr;
-            index[0] = (offs_t*)((char*)index[0] + shift);
+            baseAddr = addr; // 更新基地址
+            index[0] = (offs_t*)((char*)index[0] + shift); // 调整索引指针
             index[1] = (offs_t*)((char*)index[1] + shift);
             currIndex = (offs_t*)((char*)currIndex + shift);
-            header = (dbHeader*)addr;
+            header = (dbHeader*)addr; // 更新头部指针
         }
+        // 如果扩展文件失败，则恢复原有大小并报错
         if (status != dbFile::ok) {
             header->size = oldSize;
             handleError(FileError, "Failed to extend file", status);
         }
     }
 }
-
 
 inline bool dbDatabase::wasReserved(offs_t pos, size_t size)
 {
@@ -5581,7 +5719,12 @@ void dbDatabase::markAsAllocated(offs_t pos, int objBitSize)
     }
 }
 
-
+/**
+ * @brief 分配一块指定大小的数据库对象空间，并返回其偏移地址
+ * @param size  需要分配的字节数
+ * @param oid   如果为0则新分配，否则为已有对象分配新空间并复制原数据
+ * @return      分配空间的起始偏移
+ */
 offs_t dbDatabase::allocate(size_t size, oid_t oid)
 {
      static byte const firstHoleSize [] = {
@@ -5625,31 +5768,34 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
         0,1,2,2,0,3,3,3,0,1,0,2,0,1,0,4,0,1,2,2,0,1,0,3,0,1,0,2,0,1,0,0
     };
 
-    setDirty();
+    setDirty(); // 标记数据库已被修改
 
+    // 对齐分配大小到最小分配单元
     size = DOALIGN(size, dbAllocationQuantum);
-    int objBitSize = (int)(size >> dbAllocationQuantumBits);
+    int objBitSize = (int)(size >> dbAllocationQuantumBits); // 以最小分配单元为单位的bit数
     offs_t pos;
     oid_t i, firstPage, lastPage;
     int holeBitSize = 0;
     int allocBitSize = objBitSize;
-    int alignment = size & (dbPageSize-1);
-    const size_t    inc = dbPageSize/dbAllocationQuantum/8;
+    int alignment = size & (dbPageSize-1); // 判断是否整页对齐
+    const size_t inc = dbPageSize/dbAllocationQuantum/8;
     size_t offs;
 
-    const int  pageBits = dbPageSize*8;
-    int        holeBeforeFreePage  = 0;
-    oid_t      freeBitmapPage = 0;
+    const int pageBits = dbPageSize*8;
+    int holeBeforeFreePage = 0;
+    oid_t freeBitmapPage = 0;
 
     lastPage = dbBitmapId + dbBitmapPages;
-    allocatedSize += (offs_t)size;
+    allocatedSize += (offs_t)size; // 累计分配空间
 
+    // 整页分配流程
     if (alignment == 0) {
         if (reservedChainLength & 1) { 
             FASTDB_ASSERT(size == dbPageSize);
             allocBitSize <<= 1;
         }
         if (reservedChainLength > dbAllocRecursionLimit) {
+            // 递归分配过多，直接从bitmapEnd逆序查找空闲页
             firstPage = bitmapEnd;
             if (firstPage >= lastPage) {
                 firstPage = lastPage;
@@ -5661,10 +5807,12 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
             bitmapEnd = --firstPage;
             offs = 0;
         } else {
+            // 常规分配，从当前页和偏移开始查找
             firstPage = (oid_t)currPBitmapPage;
             offs = DOALIGN(currPBitmapOffs, inc);
         }
     } else {
+        // 非整页分配，优先尝试fixedSizeAllocator
         int retries = -1;
         do {
             retries += 1;
@@ -5674,11 +5822,11 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
 
         if (pos != 0) {
             {
+                // 分配成功，写入数据并更新索引
                 dbLocation location(this, pos, size);
                 if (oid != 0) {
                     offs_t prev = currIndex[oid];
-                    memcpy(baseAddr+pos,
-                       baseAddr+(prev&~dbInternalObjectMarker), size);
+                    memcpy(baseAddr+pos, baseAddr+(prev&~dbInternalObjectMarker), size);
                     currIndex[oid] = (prev & dbInternalObjectMarker) + pos;
                 }
                 markAsAllocated(pos, objBitSize);
@@ -5687,13 +5835,15 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
             return pos;
         }
 
+        // fallback: 从bitmap查找
         firstPage = (oid_t)currRBitmapPage;
         offs = currRBitmapOffs;
     }
 
+    // 主循环：遍历bitmap页，查找连续空闲空间
     while (true) {
         if (alignment == 0) {
-            // allocate page object
+            // 整页对象分配
             for (i = firstPage; i < lastPage && currIndex[i] != dbFreeHandleMarker; i++){
                 int spaceNeeded = allocBitSize - holeBitSize < pageBits
                     ? allocBitSize - holeBitSize : pageBits;
@@ -5709,6 +5859,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                         offs = DOALIGN(offs, inc);
                         holeBitSize = 0;
                     } else if ((holeBitSize += 8) == allocBitSize) {
+                        // 找到足够空洞，进行分配
                         pos = (offs_t)(((offs_t(i-dbBitmapId)*dbPageSize + offs)*8
                                - holeBitSize) << dbAllocationQuantumBits);
                         if (wasReserved(pos, size)) {
@@ -5722,8 +5873,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                             dbLocation location(this, pos, size);
                             if (oid != 0) {
                                 offs_t prev = currIndex[oid];
-                                memcpy(baseAddr+pos,
-                                   baseAddr+(prev&~dbInternalObjectMarker), size);
+                                memcpy(baseAddr+pos, baseAddr+(prev&~dbInternalObjectMarker), size);
                                 currIndex[oid] = (prev & dbInternalObjectMarker) + pos;
                             }
                             size_t holeBytes = holeBitSize >> 3;
@@ -5766,6 +5916,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                 offs = 0;
             }
         } else {
+            // 非整页对象分配
             for (i=firstPage; i<lastPage && currIndex[i] != dbFreeHandleMarker; i++){
                 int spaceNeeded = objBitSize - holeBitSize < pageBits
                     ? objBitSize - holeBitSize : pageBits;
@@ -5780,6 +5931,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                 while (offs < dbPageSize) {
                     int mask = begin[offs];
                     if (holeBitSize + firstHoleSize[mask] >= objBitSize) {
+                        // 找到足够空洞，分配
                         pos = (offs_t)(((offs_t(i-dbBitmapId)*dbPageSize + offs)*8
                                - holeBitSize) << dbAllocationQuantumBits);
                         if (wasReserved(pos, size)) {
@@ -5794,8 +5946,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                             currRBitmapOffs = offs;
                             if (oid != 0) {
                                 offs_t prev = currIndex[oid];
-                                memcpy(baseAddr+pos,
-                                       baseAddr+(prev&~dbInternalObjectMarker), size);
+                                memcpy(baseAddr+pos, baseAddr+(prev&~dbInternalObjectMarker), size);
                                 currIndex[oid] = (prev & dbInternalObjectMarker) + pos;
                             }
                             begin = put(i);
@@ -5822,6 +5973,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                         file.markAsDirty(pos, size);
                         return pos;
                     } else if (maxHoleSize[mask] >= objBitSize) {
+                        // mask内有最大空洞，直接分配
                         int holeBitOffset = maxHoleOffset[mask];
                         pos = (offs_t)(((offs_t(i-dbBitmapId)*dbPageSize + offs)*8 +
                                holeBitOffset) << dbAllocationQuantumBits);
@@ -5837,8 +5989,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                             currRBitmapOffs = offs;
                             if (oid != 0) {
                                 offs_t prev = currIndex[oid];
-                                memcpy(baseAddr+pos,
-                                       baseAddr+(prev&~dbInternalObjectMarker), size);
+                                memcpy(baseAddr+pos, baseAddr+(prev&~dbInternalObjectMarker), size);
                                 currIndex[oid] = (prev & dbInternalObjectMarker) + pos;
                             }
                             begin = put(i);
@@ -5862,6 +6013,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
                 offs = 0;
             }
         }
+        // 没有找到合适空洞，需扩展文件空间
         if (firstPage == dbBitmapId || reservedChainLength > dbAllocRecursionLimit) {
             if (freeBitmapPage > i) {
                 i = freeBitmapPage;
@@ -5872,6 +6024,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
             }
             FASTDB_ASSERT(currIndex[i] == dbFreeHandleMarker);
 
+            // 计算需要扩展的页数并分配
             size_t extension = (size > extensionQuantum)
                              ? size : extensionQuantum;
             int morePages =
@@ -5942,6 +6095,7 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
             file.markAsDirty(pos, size);
             return pos;
         }
+        // 没找到则回退到下一个bitmap页继续查找
         freeBitmapPage = i;
         holeBeforeFreePage = holeBitSize;
         holeBitSize = 0;
@@ -5951,6 +6105,11 @@ offs_t dbDatabase::allocate(size_t size, oid_t oid)
     }
 }
 
+/**
+ * @brief 释放指定偏移和大小的数据库对象空间
+ * @param pos  释放空间的起始偏移
+ * @param size 释放空间的字节数
+ */
 void dbDatabase::deallocate(offs_t pos, size_t size)
 {
     FASTDB_ASSERT(pos != 0 && (pos & (dbAllocationQuantum-1)) == 0);
@@ -5961,13 +6120,16 @@ void dbDatabase::deallocate(offs_t pos, size_t size)
     byte*  p = put(pageId) + offs;
     int    bitOffs = quantNo & 7;
 
+    // 更新空间分配计数
     allocatedSize -= objBitSize*dbAllocationQuantum;
     if ((deallocatedSize += objBitSize*dbAllocationQuantum) >= freeSpaceReuseThreshold)
     {
+        // 达到回收阈值，重置分配游标
         deallocatedSize = 0;
         currRBitmapPage = currPBitmapPage = dbBitmapId;
         currRBitmapOffs = currPBitmapOffs = 0;
     } else {
+        // 维护分配游标，避免分配到刚释放的空间
         if ((size_t(pos) & (dbPageSize-1)) == 0 && size >= dbPageSize) {
             if (pageId == currPBitmapPage && offs < currPBitmapOffs) {
                 currPBitmapOffs = offs;
@@ -5980,8 +6142,9 @@ void dbDatabase::deallocate(offs_t pos, size_t size)
             }
         }
     }
-    bitmapPageAvailableSpace[pageId] = INT_MAX;
+    bitmapPageAvailableSpace[pageId] = INT_MAX; // 标记该页可用空间最大
 
+    // 清除bitmap对应bit，标记空间为可用
     if (objBitSize > 8 - bitOffs) {
         objBitSize -= 8 - bitOffs;
         *p++ &= (1 << bitOffs) - 1;
@@ -6010,6 +6173,7 @@ void dbDatabase::cloneBitmap(offs_t pos, size_t size)
     size_t offs = quantNo % (dbPageSize*8) / 8;
     int    bitOffs = quantNo & 7;
 
+    // 拷贝已修改区域bitmap对应的页
     put(pageId);
     if (objBitSize > 8 - bitOffs) {
         objBitSize -= 8 - bitOffs;
@@ -6303,10 +6467,11 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
 #if DEBUG_LOCKS
     long selfId = dbThread::getCurrentThreadId();
 #endif
+    // 1. 处理延迟提交相关逻辑
     if (commitDelay != 0 && lockType != dbCommitLock) {
         dbCriticalSection cs(delayedCommitStopTimerMutex);
         if (monitor->delayedCommitContext == ctx && ctx->commitDelayed) {
-            // skip delayed transaction because this thread is starting new transaction
+            // 如果本线程已处于延迟提交状态，跳过并重置
             monitor->delayedCommitContext = NULL;
             ctx->commitDelayed = false;
             if (commitTimerStarted != 0) {
@@ -6319,30 +6484,36 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
             }
             delayedCommitStopTimerEvent.signal();
         } else {
+            // 需要强制提交
             monitor->forceCommitCount += 1;
             delayedCommitForced = true;
         }
     }
 
+    // 2. 设置事务类型（写事务/只读事务）
     if (lockType != dbSharedLock) {
         ctx->isMutator = true;
     }
+    // 3. 并发更新模式下的写锁处理
     if (accessType == dbConcurrentUpdate && lockType != dbCommitLock) {
         if (!ctx->mutatorCSLocked) {
+            // 获取mutator临界区锁
             mutatorCS.enter();
             ctx->mutatorCSLocked = true;
 #ifdef RECOVERABLE_CRITICAL_SECTION
             if (monitor->modified) {
-                // mutatorCS lock was revoked
+                // 如果锁被撤销，恢复现场
                 monitor->modified = false;
                 checkVersion();
                 recovery();
             }
 #endif
         } else if (!delayedCommitForced) {
+            // 已经加锁且不是强制提交，直接返回
             return true;
         }
     } else if (lockType != dbSharedLock) {
+        // 4. 独占锁（写事务）处理
         if (!ctx->writeAccess) {
 //            FASTDB_ASSERT(accessType != dbReadOnly && accessType != dbConcurrentRead);
             cs.enter();
@@ -6350,10 +6521,12 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
             startWatchDogThreads();
 #endif
             if (ctx->readAccess) {
+                // 4.1 读锁升级为写锁，可能导致死锁，需特殊处理
                 FASTDB_ASSERT(monitor->nWriters == 0);
                 TRACE_MSG(("Attempt to upgrade lock from shared to exclusive can cause deadlock\n"));
 
                 if (monitor->nReaders != 1) {
+                    // 多读者并发，需等待升级
                     if (monitor->waitForUpgrade) {
                         handleError(Deadlock);
                     }
@@ -6365,19 +6538,19 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                     if (commitDelay != 0) {
                         delayedCommitStopTimerEvent.signal();
                     }
+                    // 等待升级，处理死锁和崩溃恢复
                     while (!upgradeSem.wait(waitLockTimeout)
                            || !(monitor->nWriters == 1 && monitor->nReaders == 0))
                     {
-                        // There are no writers, so some reader was died
                         cs.enter();
                         unsigned currTime = dbSystem::getCurrentTimeMsec();
                         if (currTime - monitor->lastDeadlockRecoveryTime
                             >= waitLockTimeout)
                         {
-                            // Ok, let's try to "remove" this reader
+                            // 处理死锁，尝试移除崩溃的reader
                             monitor->lastDeadlockRecoveryTime = currTime;
                             if (--monitor->nReaders == 1) {
-                                // Looks like we are recovered
+                                // 恢复成功
 #if defined(AUTO_DETECT_PROCESS_CRASH) || DEBUG_LOCKS
                                 removeLockOwner(selfId);
 #endif
@@ -6400,12 +6573,14 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                     cs.leave();
                 }
             } else {
+                // 4.2 普通写锁获取流程
                 if (monitor->nWriters != 0 || monitor->nReaders != 0) {
                     monitor->nWaitWriters += 1;
                     cs.leave();
                     if (commitDelay != 0) {
                         delayedCommitStopTimerEvent.signal();
                     }
+                    // 等待写锁，处理死锁和崩溃恢复
                     while (!writeSem.wait(waitLockTimeout)
                            || !(monitor->nWriters == 1 && monitor->nReaders == 0))
                     {
@@ -6416,7 +6591,7 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                         {
                             monitor->lastDeadlockRecoveryTime = currTime;
                             if (monitor->nWriters != 0) {
-                                // writer was died
+                                // writer 崩溃，恢复
                                 checkVersion();
                                 recovery();
                                 monitor->nWriters = 1;
@@ -6424,10 +6599,8 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                                 cs.leave();
                                 break;
                             } else {
-                                // some reader was died
-                                // Ok, let's try to "remove" this reader
+                                // reader 崩溃，恢复
                                 if (--monitor->nReaders == 0) {
-                                    // Looks like we are recovered
                                     monitor->nWriters = 1;
                                     monitor->nWaitWriters -= 1;
                                     cs.leave();
@@ -6442,12 +6615,14 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                     cs.leave();
                 }
             }
+            // 记录写锁拥有者
             monitor->ownerPid = ctx->currPid;
 #if defined(AUTO_DETECT_PROCESS_CRASH) || DEBUG_LOCKS
             monitor->exclusiveLockOwner = selfId;
 #endif
             ctx->writeAccess = true;
         } else {
+            // 已经拥有写锁
             if (monitor->ownerPid != ctx->currPid) {
                 handleError(LockRevoked);
             }
@@ -6456,6 +6631,7 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
             }
         }
     } else {
+        // 5. 只读锁处理
         if (!ctx->readAccess && !ctx->writeAccess) {
             cs.enter();
 #ifdef AUTO_DETECT_PROCESS_CRASH
@@ -6467,6 +6643,7 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                 if (commitDelay != 0) {
                     delayedCommitStopTimerEvent.signal();
                 }
+                // 等待读锁，处理死锁和崩溃恢复
                 while (!readSem.wait(waitLockTimeout)
                        || !(monitor->nWriters == 0 && monitor->nReaders > 0))
                 {
@@ -6477,12 +6654,12 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
                     {
                         monitor->lastDeadlockRecoveryTime = currTime;
                         if (monitor->nWriters != 0) {
-                            // writer was died
+                            // writer 崩溃，恢复
                             checkVersion();
                             recovery();
                             monitor->nWriters = 0;
                         } else {
-                            // some potential writer was died
+                            // 潜在 writer 崩溃，恢复
                             monitor->nWaitWriters -= 1;
                         }
                         monitor->nReaders += 1;
@@ -6509,14 +6686,17 @@ bool dbDatabase::beginTransaction(dbLockType lockType)
             return true;
         }
     }
+    // 6. 事务锁获取后，处理延迟提交计数和版本校验
     if (lockType != dbCommitLock) {
         if (delayedCommitForced) {
             dbCriticalSection cs(delayedCommitStopTimerMutex);
             monitor->forceCommitCount -= 1;
         }
+        // 版本校验
         if (!checkVersion()) {
             return false;
         }
+        // 7. 设置当前事务可见的索引指针
         cs.enter();
         index[0] = (offs_t*)(baseAddr + header->root[0].index);
         index[1] = (offs_t*)(baseAddr + header->root[1].index);
@@ -6659,18 +6839,21 @@ void dbDatabase::commit()
 
 void dbDatabase::commit(dbDatabaseThreadContext* ctx)
 {
+    // 1. 日志阶段1：如果开启了事务日志，先写入日志
     if (logger != NULL) {
         if (!logger->commitPhase1()) {
             handleError(RejectedByTransactionLogger);
         }
     }
     //
-    // commit transaction
+    // 2. 正式提交事务
     //
-    int curr = header->curr;
-    int4 *map = monitor->dirtyPagesMap;
-    size_t oldIndexSize = header->root[curr].indexSize;
-    size_t newIndexSize = header->root[1-curr].indexSize;
+    int curr = header->curr; // 当前主索引编号
+    int4 *map = monitor->dirtyPagesMap; // 脏页位图
+    size_t oldIndexSize = header->root[curr].indexSize; // 旧主索引大小
+    size_t newIndexSize = header->root[1-curr].indexSize; // 新影子索引大小
+
+    // 3. 如果需要扩容索引区，分配新空间并全量拷贝
     if (newIndexSize > oldIndexSize) {
         offs_t newIndex = allocate(newIndexSize*sizeof(offs_t));
         header->root[1-curr].shadowIndex = newIndex;
@@ -6680,18 +6863,18 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
     }
 
     //
-    // Enable read access to the database
+    // 4. 切换锁和事务状态，允许读事务访问
     //
     cs.enter();
     FASTDB_ASSERT(ctx->writeAccess);
     monitor->commitInProgress = true;
     monitor->sharedLockOwner[0] = monitor->exclusiveLockOwner;
     monitor->exclusiveLockOwner = 0;
-    monitor->nWriters -= 1;
-    monitor->nReaders += 1;
+    monitor->nWriters -= 1; // 写者数减1
+    monitor->nReaders += 1; // 读者数加1
     monitor->ownerPid.clear();
     if (accessType == dbConcurrentUpdate) {
-        // now readers will see updated data
+        // 并发更新模式下，切换主索引编号，让新读事务看到最新数据
         monitor->curr ^= 1;
     }
     if (monitor->nWaitReaders != 0) {
@@ -6702,13 +6885,14 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
     ctx->writeAccess = false;
     ctx->readAccess = true;
 
-    // Copy values of this fields to local variables since them can be changed by read-only transaction in concurrent update mode
+    // 5. 拷贝当前索引状态到本地变量（防止并发只读事务改变）
     size_t   committedIndexSize = this->committedIndexSize;
     offs_t*  currIndex = this->currIndex;
     size_t   currIndexSize = this->currIndexSize;
 
     cs.leave();
 
+    // 6. 处理索引区的脏页，释放被覆盖的对象
     size_t   nPages = committedIndexSize / dbHandlesPerPage;
     offs_t*  srcIndex = currIndex;
     offs_t*  dstIndex = index[curr];
@@ -6718,6 +6902,7 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
             file.markAsDirty(header->root[1-curr].index + i*dbPageSize, dbPageSize);
             for (size_t j = 0; j < dbHandlesPerPage; j++) {
                 offs_t offs = dstIndex[j];
+                // 如果新旧索引不一致，释放旧对象
                 if (srcIndex[j] != offs) {
                     if (!(offs & dbFreeHandleMarker)) {
                         size_t marker = offs & dbInternalObjectMarker;
@@ -6733,6 +6918,7 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
         dstIndex += dbHandlesPerPage;
         srcIndex += dbHandlesPerPage;
     }
+    // 7. 处理最后不足一页的部分
     file.markAsDirty(header->root[1-curr].index + nPages*dbPageSize,
                      (currIndexSize - nPages*dbHandlesPerPage)*sizeof(offs_t));
     offs_t* end = index[curr] + committedIndexSize;
@@ -6751,9 +6937,11 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
         dstIndex += 1;
         srcIndex += 1;
     }
+    // 8. 标记头部为脏并刷盘
     file.markAsDirty(0, sizeof(dbHeader));
     file.flush();
 
+    // 9. 等待备份完成（如有），切换主索引编号
     cs.enter();
     while (monitor->backupInProgress) {
         cs.leave();
@@ -6763,6 +6951,7 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
     header->curr = curr ^= 1;
     cs.leave();
 
+    // 10. 再次刷盘，保证头部和索引一致
     file.markAsDirty(0, sizeof(dbHeader));
 #ifdef SYNCHRONOUS_REPLICATION
     waitTransactionAcknowledgement();
@@ -6777,7 +6966,9 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
     monitor->sessionFreeList[1-curr] = monitor->sessionFreeList[curr];
 #endif
 
+    // 11. 同步影子索引和主索引内容
     if (newIndexSize != oldIndexSize) {
+        // 索引区扩容，全量拷贝
         header->root[1-curr].index=header->root[curr].shadowIndex;
         header->root[1-curr].indexSize=header->root[curr].shadowIndexSize;
         header->root[1-curr].shadowIndex=header->root[curr].index;
@@ -6788,6 +6979,7 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
         memset(map, 0, 4*((currIndexSize+dbHandlesPerPage*32-1)
                           / (dbHandlesPerPage*32)));
     } else {
+        // 索引区未扩容，只同步脏页
         byte* srcIndex = (byte*)currIndex;
         byte* dstIndex = (byte*)index[1-curr];
 
@@ -6810,6 +7002,7 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
                     / (dbHandlesPerPage*32) - (nPages>>5))*4);
         }
     }
+    // 12. 提交完成，重置标记
     cs.enter();
     modified = false;
     monitor->modified = false;
@@ -6821,10 +7014,12 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
     monitor->concurrentTransId += 1;
     cs.leave();
 
+    // 13. 日志阶段2
     if (logger != NULL) {
         logger->commitPhase2();
     }
 
+    // 14. 结束本次事务
     if (ctx->writeAccess || ctx->readAccess || ctx->mutatorCSLocked) {
         endTransaction(ctx);
     }
@@ -6832,16 +7027,20 @@ void dbDatabase::commit(dbDatabaseThreadContext* ctx)
 
 void dbDatabase::rollback()
 {
+    // 1. 日志回滚
     if (logger != NULL) {
         logger->rollback();
     }
     dbDatabaseThreadContext* ctx = threadContext.get();
+    // 2. 如果有延迟提交，先获取独占锁
     if (commitDelay != 0) {
         beginTransaction(dbExclusiveLock);
     }
+    // 3. 判断是否需要回滚
     if (modified
         && (monitor->uncommittedChanges || ctx->writeAccess || ctx->mutatorCSLocked || ctx->concurrentId == monitor->concurrentTransId))
     {
+        // 4. 没有写权限则获取独占锁
         if (!ctx->writeAccess && !ctx->mutatorCSLocked) {
             beginTransaction(dbExclusiveLock);
         }
@@ -6849,16 +7048,21 @@ void dbDatabase::rollback()
         byte* dstIndex = baseAddr + header->root[curr].shadowIndex;
         byte* srcIndex = (byte*)index[curr];
 
+        // 5. 重置分配器辅助变量
         currRBitmapPage = currPBitmapPage = dbBitmapId;
         currRBitmapOffs = currPBitmapOffs = 0;
 
         size_t nPages =
             (committedIndexSize + dbHandlesPerPage - 1) / dbHandlesPerPage;
         int4 *map = monitor->dirtyPagesMap;
+
+        // 6. 恢复影子索引内容为主索引快照
         if (header->root[1-curr].index != header->root[curr].shadowIndex) {
+            // 如果影子索引空间不同，全量拷贝
             memcpy(dstIndex, srcIndex,  nPages*dbPageSize);
             file.markAsDirty( header->root[curr].shadowIndex, nPages*dbPageSize);
         } else {
+            // 否则只拷贝脏页
             for (size_t i = 0; i < nPages; i++) {
                 if (map[i >> 5] & (1 << (i & 31))) {
                     memcpy(dstIndex, srcIndex, dbPageSize);
@@ -6869,6 +7073,7 @@ void dbDatabase::rollback()
             }
         }
 
+        // 7. 更新影子索引元数据
         header->root[1-curr].indexSize = header->root[curr].shadowIndexSize;
         header->root[1-curr].indexUsed = header->root[curr].indexUsed;
         header->root[1-curr].freeList  = header->root[curr].freeList;
@@ -6880,12 +7085,14 @@ void dbDatabase::rollback()
         memset(map, 0,
                size_t((currIndexSize+dbHandlesPerPage*32-1) / (dbHandlesPerPage*32))*4);
 
+        // 8. 标记头部为脏，重置修改标记，恢复表一致性
         file.markAsDirty(0, sizeof(dbHeader));
         modified = false;
         monitor->uncommittedChanges = false;
         monitor->concurrentTransId += 1;
         restoreTablesConsistency();
     }
+    // 9. 结束事务
     if (monitor->users != 0) { // if not abandon
         endTransaction(ctx);
     }
