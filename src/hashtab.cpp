@@ -212,8 +212,16 @@ inline unsigned calculateHashCode(dbDatabase* db, byte* record, byte* key, dbFie
     }
 }
 
+/**
+ * 向哈希表中插入记录
+ * @param db 数据库对象指针
+ * @param fd 字段描述符，包含哈希表信息
+ * @param rowId 待插入记录的对象ID
+ * @param nRows 总记录数，用于判断是否需要扩容
+ */
 void dbHashTable::insert(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId, size_t nRows)
 {
+    // 获取哈希表对象
     oid_t hashId = fd->hashTable;
     dbHashTable* hash = (dbHashTable*)db->get(hashId);
     byte* record = db->get(rowId);
@@ -221,16 +229,20 @@ void dbHashTable::insert(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId, siz
     unsigned hashcode = calculateHashCode(db, record, key, fd);
     size_t size = hash->size;
     oid_t pageId = hash->page;
+
+    // 判断是否需要扩容哈希表
     if (size < nRows && hash->used*3/2 > size) {
         TRACE_MSG(("Reallocate hash table, used=%ld, size=%ld\n", hash->used, size));
         int nPages = (int)((size+dbIdsPerPage-1) / dbIdsPerPage);
         size_t i;
+        // 选择下一个合适的素数作为新表大小
         for (i = 0; i < itemsof(primeNumbers)-1 && primeNumbers[i] < size; i++);
         if (i < itemsof(primeNumbers)-1) { 
             i += 1;
         }
         size = primeNumbers[i];
         int nNewPages = (int)((size+dbIdsPerPage-1) / dbIdsPerPage);
+        // 分配新哈希表页
         oid_t newPageId = db->allocateId(nNewPages);
         offs_t pos = db->allocate(nNewPages*dbPageSize);
         assert((pos & (dbPageSize-1)) == 0);
@@ -239,6 +251,7 @@ void dbHashTable::insert(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId, siz
         hash->size = (nat4)size;
         hash->page = newPageId;
         size_t used = 0;
+        // 重新分配并迁移旧表数据到新表
         while (--nPages >= 0) { 
             for (i = 0; i < dbIdsPerPage; i++) { 
                 oid_t itemId = ((oid_t*)db->get(pageId))[i];
@@ -247,6 +260,7 @@ void dbHashTable::insert(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId, siz
                     oid_t nextId = item->next;
                     unsigned h = item->hash % size;
                     oid_t* tab = (oid_t*)(db->baseAddr + pos);
+                    // 如果链表头发生变化，则修正next指针
                     if (item->next != tab[h]) { 
                         item = (dbHashTableItem*)db->put(itemId);
                         tab = (oid_t*)(db->baseAddr + pos);
@@ -263,44 +277,57 @@ void dbHashTable::insert(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId, siz
         }
         ((dbHashTable*)db->get(hashId))->used = (nat4)used;
         pageId = newPageId;
+        // 更新currIndex，建立新哈希表页的索引
         while (--nNewPages >= 0) { 
             db->currIndex[newPageId++] = pos + dbPageObjectMarker;
             pos += dbPageSize;
         }
     } 
+    // 分配新的哈希项对象
     oid_t itemId = db->allocateObject(dbHashTableItemMarker);
     unsigned h = hashcode % size;
+    // 找到对应哈希桶的位置，插入新项到链表头
     oid_t* ptr = (oid_t*)db->put(pageId + h/dbIdsPerPage) + h%dbIdsPerPage;
     dbHashTableItem* item = (dbHashTableItem*)db->get(itemId);
     item->record = rowId;
     item->hash = hashcode;
     item->next = *ptr;
     *ptr = itemId;
+    // 如果是新链表，更新used并标记哈希表为脏
     if (item->next == 0) { 
         ((dbHashTable*)db->get(hashId))->used += 1;
         db->file.markAsDirty(db->currIndex[hashId] & ~dbInternalObjectMarker, sizeof(dbHashTable));
     }
 }
 
-    
+/**
+ * 从哈希表中移除记录
+ * @param db 数据库对象指针
+ * @param fd 字段描述符，包含哈希表信息
+ * @param rowId 待移除记录的对象ID
+ */
 void dbHashTable::remove(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId)
 {
+    // 获取哈希表对象
     oid_t hashId = fd->hashTable;
     dbHashTable* hash = (dbHashTable*)db->get(hashId);
     byte* record = (byte*)db->getRow(rowId);
     byte* key = record + fd->dbsOffs;
     unsigned hashcode = calculateHashCode(db, record, key, fd);
     unsigned h = hashcode % hash->size;
+    // 每个页面中最多可以容纳 dbIdsPerPage 个哈希桶，通过i获取具体位置
     oid_t pageId = hash->page + h / dbIdsPerPage;
     int i = h % dbIdsPerPage;
     oid_t itemId = ((oid_t*)db->get(pageId))[i];
     oid_t prevItemId = 0;
+    // 遍历链表查找目标项
     while (true) { 
         assert(itemId != 0);
         dbHashTableItem* item = (dbHashTableItem*)db->get(itemId);
         if (item->record == rowId) { 
             oid_t next = item->next;
             if (prevItemId == 0) { 
+                // 删除的是链表头，若链表为空则更新used并标脏
                 if (next == 0) { 
                     hash->used -= 1; // consistency can be violated
                     db->file.markAsDirty(db->currIndex[hashId] & ~dbInternalObjectMarker, 
@@ -308,6 +335,7 @@ void dbHashTable::remove(dbDatabase* db, dbFieldDescriptor* fd, oid_t rowId)
                 }
                 *((oid_t*)db->put(pageId) + i) = next;
             } else {    
+                // 删除的是链表中间节点，修正前驱节点的next
                 item = (dbHashTableItem*)db->put(prevItemId);
                 item->next = next;
             }

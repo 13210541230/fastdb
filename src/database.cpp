@@ -3295,15 +3295,17 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
     oid_t firstId = table->firstRow;
     int nNewIndices = 0;
     int nDelIndices = 0;
+
+    // 遍历所有字段，处理哈希索引和树型索引的创建/删除
     for (fd = desc->firstField; fd != NULL; fd = fd->nextField) {
+        // 处理哈希索引
         if ((fd->indexType & HASHED) && fd->type != dbField::tpStructure) {
             if (fd->hashTable == 0) {
+                // 非 alter 模式下，如果有其他活跃应用，禁止新建索引，防止不一致
                 if (!alter && tableId < committedIndexSize
                     && index[0][tableId] == index[1][tableId])
                 {
-                    // If there are some other active applications which
-                    // can use this table, then they will not know
-                    // about newly created index, which leads to inconsistency
+                    // 存在其他活跃应用时，不能直接新增索引，否则会导致数据不一致
                     return false;
                 }
                 fd->indexType |= NEW_INDEX;
@@ -3312,6 +3314,7 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
                 TRACE_MSG(("Create hash table for field '%s'\n", fd->name));
             }
         } else if (fd->hashTable != 0) {
+            // 需要删除哈希索引
             if (alter) {
                 TRACE_MSG(("Remove hash table for field '%s'\n", fd->name));
                 nDelIndices += 1;
@@ -3320,6 +3323,8 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
                 return false;
             }
         }
+
+        // 处理树型索引
         if ((fd->indexType & INDEXED) && fd->type != dbField::tpStructure) {
             if (fd->tTree == 0) {
                 if (!alter && tableId < committedIndexSize
@@ -3333,6 +3338,7 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
                 TRACE_MSG(("Create index for field '%s'\n", fd->name));
             }
         } else if (fd->tTree != 0) {
+            // 需要删除树型索引
             if (alter) {
                 nDelIndices += 1;
                 TRACE_MSG(("Remove index for field '%s'\n", fd->name));
@@ -3342,14 +3348,18 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
             }
         }
     }
+
+    // 如果有新建索引，需要将所有已有数据插入新索引
     if (nNewIndices > 0) {
         modified = true;
         for (oid_t rowId = firstId; rowId != 0; rowId = getRow(rowId)->next) {
+            // 插入哈希索引
             for (fd = desc->hashedFields; fd != NULL; fd=fd->nextHashedField) {
                 if (fd->indexType & NEW_INDEX) {
                     dbHashTable::insert(this, fd, rowId, 2*nRows);
                 }
             }
+            // 插入树型索引
             for (fd=desc->indexedFields; fd != NULL; fd=fd->nextIndexedField) {
                 if (fd->indexType & NEW_INDEX) {
                     if (fd->type == dbField::tpRectangle) {
@@ -3361,15 +3371,19 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
                 }
             }
         }
+        // 清除 NEW_INDEX 标记
         for (fd = desc->firstField; fd != NULL; fd = fd->nextField) {
             fd->indexType &= ~NEW_INDEX;
         }
     }
+
+    // 如果有索引增删，需要同步更新表结构中的 field 信息
     if (nNewIndices + nDelIndices != 0) {
         table = (dbTable*)putRow(tableId);
         offs_t fieldOffs = currIndex[tableId] + table->fields.offs;
         for (fd = desc->firstField; fd != NULL; fd = fd->nextField) {
             dbField* field = (dbField*)(baseAddr + fieldOffs);
+            // 同步哈希表指针
             if (field->hashTable != fd->hashTable) {
                 if (field->hashTable != 0) {
                     FASTDB_ASSERT(fd->hashTable == 0);
@@ -3379,6 +3393,7 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
                 }
                 field->hashTable = fd->hashTable;
             }
+            // 同步树型索引指针
             if (field->tTree != fd->tTree) {
                 if (field->tTree != 0) {
                     FASTDB_ASSERT(fd->tTree == 0);
@@ -3399,44 +3414,58 @@ bool dbDatabase::addIndices(bool alter, dbTableDescriptor* desc)
 }
 
 
-void dbDatabase::updateTableDescriptor(dbTableDescriptor* desc, oid_t tableId)
+// 更新表描述符
+void dbDatabase::updateTableDescriptor(dbTableDescriptor* desc, oid_t tableId) 
 {
+    // 计算新表结构所需的总大小 = 表头大小 + 所有字段结构大小 + 所有名称字符串总长度
     size_t newSize = sizeof(dbTable) + desc->nFields*sizeof(dbField)
         + desc->totalNamesLength();
+    // 重新链接表描述符
     linkTable(desc, tableId);
 
+    // 获取当前表结构数据
     dbTable* table = (dbTable*)getRow(tableId);
+    // 保存原表的行数、首行和末行OID
     int   nRows = table->nRows;
     oid_t first = table->firstRow;
     oid_t last = table->lastRow;
 #ifdef AUTOINCREMENT_SUPPORT
+    // 如果有自增字段支持，保存当前计数器值
     desc->autoincrementCount = table->count;
 #endif
 
-    int nFields = table->fields.size;
-    offs_t fieldOffs = currIndex[tableId] + table->fields.offs;
+    // 遍历并删除所有字段关联的索引结构
+    int nFields = table->fields.size; // 字段数量
+    offs_t fieldOffs = currIndex[tableId] + table->fields.offs; // 字段结构起始偏移量
 
     while (--nFields >= 0) {
-        dbField* field = (dbField*)(baseAddr + fieldOffs);
-        fieldOffs += sizeof(dbField);
+        dbField* field = (dbField*)(baseAddr + fieldOffs); // 获取当前字段
+        fieldOffs += sizeof(dbField); // 移动到下一个字段
 
+        // 获取字段的哈希表和B树索引OID
         oid_t hashTableId = field->hashTable;
         oid_t tTreeId = field->tTree;
         int fieldType = field->type;
+        
+        // 删除哈希表索引(如果存在)
         if (hashTableId != 0) {
             dbHashTable::drop(this, hashTableId);
         }
+        // 删除B树索引(如果存在)
         if (tTreeId != 0) {
             if (fieldType == dbField::tpRectangle) {
-                dbRtree::drop(this, tTreeId);
+                dbRtree::drop(this, tTreeId); // 矩形类型使用R树
             } else {
-                dbTtree::drop(this, tTreeId);
+                dbTtree::drop(this, tTreeId); // 其他类型使用T树
             }
         }
     }
 
+    // 分配新的表结构空间
     table = (dbTable*)putRow(tableId, newSize);
+    // 将新描述符存储到数据库中
     desc->storeInDatabase(table);
+    // 恢复原表的行信息
     table->firstRow = first;
     table->lastRow = last;
     table->nRows = nRows;
